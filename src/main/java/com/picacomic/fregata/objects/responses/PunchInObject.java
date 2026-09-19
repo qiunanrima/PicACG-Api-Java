@@ -1,0 +1,35 @@
+package com.picacomic.fregata.objects.responses;
+
+/**
+ * 签到结果。
+ * Punch-in result.
+ */
+public class PunchInObject {
+    String punchInLastDay;
+    String status;
+
+    public PunchInObject(String status, String punchInLastDay) {
+        this.status = status;
+        this.punchInLastDay = punchInLastDay;
+    }
+
+    public String getStatus() {
+        return this.status;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public String getPunchInLastDay() {
+        return this.punchInLastDay;
+    }
+
+    public void setPunchInLastDay(String punchInLastDay) {
+        this.punchInLastDay = punchInLastDay;
+    }
+
+    public String toString() {
+        return "PunchInObject{status='" + this.status + "', punchInLastDay='" + this.punchInLastDay + "'}";
+    }
+}
