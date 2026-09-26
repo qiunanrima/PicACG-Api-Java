@@ -2,6 +2,7 @@ package com.picaapi
 
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import com.picacomic.fregata.objects.ComicPageObject
 import com.picacomic.fregata.objects.NetworkErrorObject
 import com.picacomic.fregata.objects.requests.AdjustExpBody
 import com.picacomic.fregata.objects.requests.AvatarBody
@@ -23,6 +24,7 @@ import com.picacomic.fregata.objects.responses.CategoryResponse
 import com.picacomic.fregata.objects.responses.ChatroomListResponse
 import com.picacomic.fregata.objects.responses.ComicDetailResponse
 import com.picacomic.fregata.objects.responses.ComicRandomListResponse
+import com.picacomic.fregata.objects.responses.DataClass.ComicPageResponse.ComicPagesResponse
 import com.picacomic.fregata.objects.responses.CommentPostToTopResponse
 import com.picacomic.fregata.objects.responses.ForgotPasswordResponse
 import com.picacomic.fregata.objects.responses.GeneralResponse
@@ -47,42 +49,19 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
+import java.io.File
 import java.lang.reflect.Type
+import java.util.Base64
 import java.util.UUID
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.atomic.AtomicLong
 
 /**
  * PicACG API 的线程安全 REST 客户端。
  * Thread-safe REST client for the PicACG API.
  *
- * ### 签名 / Signing
- * 所有请求都由 [okhttp3.Interceptor] 透明签名：
- * `signature = HMAC_SHA256((path + time + nonce + method + apiKey).lowercase(), key2)`。
- * 服务端时间偏移从响应头 `Server-Time` 学习并用于后续请求，与原客户端行为一致。
- *
- * Every request is transparently signed by an [okhttp3.Interceptor]:
- * `signature = HMAC_SHA256((path + time + nonce + method + apiKey).lowercase(), key2)`.
- * The server clock offset is learned from the `Server-Time` response header and
- * applied to later requests, matching the original client behaviour.
- *
- * ### 线程安全 / Threading
- * [OkHttpClient] 被共享且本身线程安全；所有可变状态（鉴权令牌、服务器时间偏移、配置）
- * 均通过 `@Volatile` / [AtomicLong] 发布。同步接口可从任意线程调用，每次调用都会新建
- * 独立的 [Call]，请求之间不共享任何可变数据。
- *
- * [OkHttpClient] is shared and thread-safe; all mutable state (authorization
- * token, server time offset, config) is published through `@Volatile` / [AtomicLong].
- * Synchronous endpoint functions may be called from any thread. Each call creates
- * its own [Call]; nothing is shared across in-flight requests.
- *
- * ### 用法 / Usage
- * ```java
- * PicaClient client = new PicaClient(new PicaConfig());
- * PicaResult<SignInResponse> result = client.signIn(new SignInBody("a@b.c", "pw"));
- * if (result instanceof PicaResult.Success) {
- *     client.updateAuthorization(((PicaResult.Success<SignInResponse>) result).getData().getToken());
- * }
- * ```
+ * 支持 Java 与 Kotlin 无缝调用，提供完整的 `@JvmOverloads`、实体查询对象、便捷重载、
+ * 函数式回调以及基于 [CompletableFuture] 的异步调用 [async]。
  */
 class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
@@ -97,7 +76,23 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
     private val gson = Gson()
     private val serverTimeOffset = AtomicLong(config.timeOffsetSeconds)
-    private val httpClient: OkHttpClient = buildHttpClient(config)
+    @Volatile
+    private var httpClient: OkHttpClient = buildHttpClient(config)
+
+    /** 获取底层的 OkHttpClient 实例。 / Raw OkHttpClient instance. */
+    val rawHttpClient: OkHttpClient
+        get() = httpClient
+
+    /** 内置的图片下载器。 / Built-in image and episode downloader. */
+    val downloader: PicaDownloader
+        get() = PicaDownloader
+
+    /** 异步调用客户端，所有方法返回 [CompletableFuture]。 / Async client returning [CompletableFuture]. */
+    val async: PicaAsyncClient by lazy { PicaAsyncClient(this) }
+
+    /** 供 Java 友好调用的异步客户端获取方法。 / Java-friendly getter for async client. */
+    @JvmName("async")
+    fun async(): PicaAsyncClient = async
 
     /** 最近一次已知的 `Server-Time - 本地时间`（秒）。 / Last known `Server-Time - localTime` in seconds. */
     val serverTimeOffsetSeconds: Long
@@ -107,6 +102,7 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     fun updateConfig(newConfig: PicaConfig) {
         config = newConfig
         serverTimeOffset.set(newConfig.timeOffsetSeconds)
+        httpClient = buildHttpClient(newConfig)
     }
 
     /** 更新鉴权令牌。 / Updates the authorization token. */
@@ -118,7 +114,6 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
     private fun buildHttpClient(cfg: PicaConfig): OkHttpClient {
         val builder = OkHttpClient.Builder()
-        // 与原项目一致：未设置任何超时，使用 OkHttp 默认值。 / Like the original: no explicit timeouts, OkHttp defaults are used.
         if (cfg.dnsIps.isNotEmpty()) {
             builder.dns(PicaNetworking.dns(cfg.dnsIps))
         }
@@ -136,8 +131,14 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     private fun signAndProceed(chain: okhttp3.Interceptor.Chain): okhttp3.Response {
         val cfg = config
         val request = chain.request()
+        val requestUrl = request.url.toString()
+        val baseUrl = cfg.normalizedBaseUrl()
+        // 若为图片 CDN 或外部资源，跳过 API 签名与协议头注入
+        if (!requestUrl.startsWith(baseUrl)) {
+            return chain.proceed(request)
+        }
         val nonce = UUID.randomUUID().toString().replace("-", "")
-        val path = request.url.toString().replace(cfg.normalizedBaseUrl(), "")
+        val path = requestUrl.replace(baseUrl, "")
         val time = (System.currentTimeMillis() / 1000L + serverTimeOffset.get()).toString()
         val signature = PicaSignature.sign(
             path = path,
@@ -163,7 +164,6 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             .build()
 
         val response = chain.proceed(signed)
-        // 从响应头学习服务端时间，修正本地时钟偏移。 / Learn server time from the header and correct the local clock offset.
         response.header("Server-Time")?.trim()?.toLongOrNull()?.let { serverTime ->
             serverTimeOffset.set(serverTime - System.currentTimeMillis() / 1000L)
         }
@@ -187,10 +187,10 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         query: Map<String, Any?>,
         authorized: Boolean,
     ): Request {
-        val requestBody: RequestBody? = if (body != null) {
-            gson.toJson(body).toRequestBody(JSON_MEDIA_TYPE)
-        } else {
-            null
+        val requestBody: RequestBody? = when {
+            body != null -> gson.toJson(body).toRequestBody(JSON_MEDIA_TYPE)
+            method == "POST" || method == "PUT" || method == "PATCH" -> EMPTY_REQUEST_BODY
+            else -> null
         }
         val builder = Request.Builder()
             .url(buildUrl(path, query))
@@ -201,8 +201,8 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         return builder.build()
     }
 
-    /** 执行一个载荷包裹在 [GeneralResponse] 中的请求。 / Executes a call whose payload is wrapped in [GeneralResponse]. */
-    private fun <T> callData(
+    /** 执行一个载荷包裹在 [GeneralResponse] 中的同步请求。 */
+    internal fun <T> callData(
         method: String,
         path: String,
         dataType: Type,
@@ -214,8 +214,8 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         dataType,
     )
 
-    /** 执行一个响应体即载荷的请求。 / Executes a call whose payload is the response body itself. */
-    private fun <T> callRaw(
+    /** 执行一个响应体即载荷的同步请求。 */
+    internal fun <T> callRaw(
         method: String,
         path: String,
         type: Type,
@@ -227,31 +227,59 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         type,
     )
 
-    /** 解析 `{ code, message, data }` 信封并返回 `data`。 / Parses the `{ code, message, data }` envelope and returns `data`. */
+    /** 执行一个载荷包裹在 [GeneralResponse] 中的异步请求。 */
+    internal fun <T> callDataAsync(
+        method: String,
+        path: String,
+        dataType: Type,
+        body: Any? = null,
+        query: Map<String, Any?> = emptyMap(),
+        authorized: Boolean = true,
+    ): CompletableFuture<PicaResult<T>> = executeDataAsync(
+        httpClient.newCall(buildRequest(method, path, body, query, authorized)),
+        dataType,
+    )
+
+    /** 执行一个响应体即载荷的异步请求。 */
+    internal fun <T> callRawAsync(
+        method: String,
+        path: String,
+        type: Type,
+        body: Any? = null,
+        query: Map<String, Any?> = emptyMap(),
+        authorized: Boolean = true,
+    ): CompletableFuture<PicaResult<T>> = executeRawAsync(
+        httpClient.newCall(buildRequest(method, path, body, query, authorized)),
+        type,
+    )
+
+    /** 解析 `{ code, message, data }` 信封并返回 `data`。 */
     @Suppress("UNCHECKED_CAST")
     private fun <T> executeData(call: Call, dataType: Type): PicaResult<T> {
         return try {
             call.execute().use { response ->
                 val text = response.body?.string()
                 if (!response.isSuccessful) return failure(response.code, text)
+                if (dataType == Unit::class.java) return PicaResult.Success(Unit as T, response.code)
                 if (text.isNullOrBlank()) return PicaResult.Success(null as T, response.code)
                 val envelopeType = TypeToken.getParameterized(GeneralResponse::class.java, dataType).type
                 val envelope: GeneralResponse<*> = gson.fromJson(text, envelopeType)
-                @Suppress("UNCHECKED_CAST")
-                PicaResult.Success(envelope.data as T, response.code)
+                val data = (envelope.data ?: if (dataType == Unit::class.java) Unit else null) as T
+                PicaResult.Success(data, response.code)
             }
         } catch (t: Throwable) {
             PicaResult.Failure(httpCode = null, message = t.message, cause = t)
         }
     }
 
-    /** 直接解析响应体为 [type]。 / Parses the response body directly into [type]. */
+    /** 直接解析响应体为 [type]。 */
     @Suppress("UNCHECKED_CAST")
     private fun <T> executeRaw(call: Call, type: Type): PicaResult<T> {
         return try {
             call.execute().use { response ->
                 val text = response.body?.string()
                 if (!response.isSuccessful) return failure(response.code, text)
+                if (type == Unit::class.java) return PicaResult.Success(Unit as T, response.code)
                 if (text.isNullOrBlank()) return PicaResult.Success(null as T, response.code)
                 PicaResult.Success(gson.fromJson<T>(text, type), response.code)
             }
@@ -260,7 +288,82 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         }
     }
 
-    /** 将非 2xx 响应转换为 [PicaResult.Failure]，并尽量解析出业务错误码。 / Converts a non-2xx response into [PicaResult.Failure], extracting the business error when possible. */
+    private fun <T> executeDataAsync(call: Call, dataType: Type): CompletableFuture<PicaResult<T>> {
+        val future = CompletableFuture<PicaResult<T>>()
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                future.complete(PicaResult.Failure(httpCode = null, message = e.message, cause = e))
+            }
+
+            override fun onResponse(call: Call, response: okhttp3.Response) {
+                try {
+                    response.use { res ->
+                        val text = res.body?.string()
+                        if (!res.isSuccessful) {
+                            future.complete(failure(res.code, text))
+                            return
+                        }
+                        if (dataType == Unit::class.java) {
+                            @Suppress("UNCHECKED_CAST")
+                            future.complete(PicaResult.Success(Unit as T, res.code))
+                            return
+                        }
+                        if (text.isNullOrBlank()) {
+                            @Suppress("UNCHECKED_CAST")
+                            future.complete(PicaResult.Success(null as T, res.code))
+                            return
+                        }
+                        val envelopeType = TypeToken.getParameterized(GeneralResponse::class.java, dataType).type
+                        val envelope: GeneralResponse<*> = gson.fromJson(text, envelopeType)
+                        @Suppress("UNCHECKED_CAST")
+                        val data = (envelope.data ?: if (dataType == Unit::class.java) Unit else null) as T
+                        future.complete(PicaResult.Success(data, res.code))
+                    }
+                } catch (t: Throwable) {
+                    future.complete(PicaResult.Failure(httpCode = null, message = t.message, cause = t))
+                }
+            }
+        })
+        return future
+    }
+
+    private fun <T> executeRawAsync(call: Call, type: Type): CompletableFuture<PicaResult<T>> {
+        val future = CompletableFuture<PicaResult<T>>()
+        call.enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: Call, e: java.io.IOException) {
+                future.complete(PicaResult.Failure(httpCode = null, message = e.message, cause = e))
+            }
+
+            override fun onResponse(call: Call, response: okhttp3.Response) {
+                try {
+                    response.use { res ->
+                        val text = res.body?.string()
+                        if (!res.isSuccessful) {
+                            future.complete(failure(res.code, text))
+                            return
+                        }
+                        if (type == Unit::class.java) {
+                            @Suppress("UNCHECKED_CAST")
+                            future.complete(PicaResult.Success(Unit as T, res.code))
+                            return
+                        }
+                        if (text.isNullOrBlank()) {
+                            @Suppress("UNCHECKED_CAST")
+                            future.complete(PicaResult.Success(null as T, res.code))
+                            return
+                        }
+                        @Suppress("UNCHECKED_CAST")
+                        future.complete(PicaResult.Success(gson.fromJson<T>(text, type), res.code))
+                    }
+                } catch (t: Throwable) {
+                    future.complete(PicaResult.Failure(httpCode = null, message = t.message, cause = t))
+                }
+            }
+        })
+        return future
+    }
+
+    /** 将非 2xx 响应转换为 [PicaResult.Failure]，并尽量解析出业务错误码。 */
     private fun failure(httpCode: Int, rawBody: String?): PicaResult.Failure {
         val error = rawBody?.let { runCatching { gson.fromJson(it, NetworkErrorObject::class.java) }.getOrNull() }
         return PicaResult.Failure(
@@ -277,7 +380,14 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
     /** `POST auth/sign-in` — 用账号密码换取令牌。 / exchange credentials for a bearer token. */
     fun signIn(body: SignInBody): PicaResult<SignInResponse> =
-        callRaw("POST", "auth/sign-in", SignInResponse::class.java, body = body, authorized = false)
+        callData("POST", "auth/sign-in", SignInResponse::class.java, body = body, authorized = false)
+
+    /** 登录成功时自动保存令牌，之后无需手动调用 [updateAuthorization]。 / Signs in and stores the token automatically. */
+    fun login(email: String, password: String): PicaResult<SignInResponse> {
+        val result = signIn(SignInBody(email, password))
+        if (result is PicaResult.Success) updateAuthorization(result.data.token)
+        return result
+    }
 
     /** `POST auth/register` — 注册新账号。 / create a new account. */
     fun register(body: RegisterBody): PicaResult<RegisterResponse> =
@@ -293,6 +403,10 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             authorized = false,
         )
 
+    /** `POST auth/forgot-password` 便捷重载。 / convenient overload for forgotPassword. */
+    fun forgotPassword(email: String): PicaResult<ForgotPasswordResponse> =
+        forgotPassword(ForgotPasswordBody(email))
+
     /** `POST auth/reset-password` — 完成重置密码流程。 / finish the password reset flow. */
     fun resetPassword(body: ResetPasswordBody): PicaResult<PasswordResponse> =
         callData(
@@ -302,6 +416,10 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             body = body,
             authorized = false,
         )
+
+    /** `POST auth/reset-password` 便捷重载。 / convenient overload for resetPassword. */
+    fun resetPassword(email: String, questionNo: Int, answer: String): PicaResult<PasswordResponse> =
+        resetPassword(ResetPasswordBody(email, questionNo, answer))
 
     // endregion
 
@@ -324,44 +442,29 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         callData("GET", "keywords", KeywordsResponse::class.java)
 
     /** `GET collections` — 服务端定义的合集。 / server-defined collections. */
-    fun getCollections(): PicaResult<com.picacomic.fregata.objects.responses.DataClass.CollectionsResponse> =
-        callData(
-            "GET",
-            "collections",
-            com.picacomic.fregata.objects.responses.DataClass.CollectionsResponse::class.java,
-        )
+    fun getCollections(): PicaResult<CollectionsResponse> =
+        callData("GET", "collections", CollectionsResponse::class.java)
 
     /** `GET chat` — 可用聊天室列表。 / available chatrooms. */
     fun getChatroomList(): PicaResult<ChatroomListResponse> =
         callData("GET", "chat", ChatroomListResponse::class.java)
 
     /** `GET pica-apps` — 第三方 Pica 应用目录。 / third-party Pica app catalogue. */
-    fun getPicaApps(): PicaResult<com.picacomic.fregata.objects.responses.DataClass.PicaAppsResponse> =
-        callData(
-            "GET",
-            "pica-apps",
-            com.picacomic.fregata.objects.responses.DataClass.PicaAppsResponse::class.java,
-        )
+    fun getPicaApps(): PicaResult<PicaAppsResponse> =
+        callData("GET", "pica-apps", PicaAppsResponse::class.java)
 
     /** `GET announcements?page=` — 公告列表。 / announcement list. */
-    fun getAnnouncements(
-        page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.AnnouncementsResponse.AnnouncementsResponse> =
-        callData(
-            "GET",
-            "announcements",
-            com.picacomic.fregata.objects.responses.DataClass.AnnouncementsResponse.AnnouncementsResponse::class.java,
-            query = mapOf("page" to page),
-        )
+    @JvmOverloads
+    fun getAnnouncements(page: Int = 1): PicaResult<AnnouncementsResponse> =
+        callData("GET", "announcements", AnnouncementsResponse::class.java, query = mapOf("page" to page))
 
     /** `GET applications?platform=android&page=` — 应用列表。 / application list. */
-    fun getApplications(
-        page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ApplicationsResponse.ApplicationsResponse> =
+    @JvmOverloads
+    fun getApplications(page: Int = 1): PicaResult<ApplicationsResponse> =
         callData(
             "GET",
             "applications",
-            com.picacomic.fregata.objects.responses.DataClass.ApplicationsResponse.ApplicationsResponse::class.java,
+            ApplicationsResponse::class.java,
             query = mapOf("platform" to "android", "page" to page),
         )
 
@@ -369,18 +472,15 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
     // region 漫画 / comics ----------------------------------------------------------------------
 
+    /** 使用 [ComicQuery] 检索漫画列表。 / Query comics using [ComicQuery]. */
+    fun getComics(query: ComicQuery): PicaResult<ComicListResponse> =
+        callData("GET", "comics", ComicListResponse::class.java, query = query.toQueryMap())
+
     /**
      * `GET comics` — 漫画列表/搜索。
      * `GET comics` — comic listing/search.
-     *
-     * @param category 分类过滤 / category filter
-     * @param tag 标签过滤 / tag filter
-     * @param author 作者过滤 / author filter
-     * @param finished 是否完结 / finished flag
-     * @param sort 排序方式 / sort order
-     * @param categoryType 分类类型 / category type
-     * @param categoryArea 分类地区 / category area
      */
+    @JvmOverloads
     fun getComics(
         page: Int = 1,
         category: String? = null,
@@ -390,32 +490,72 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         sort: String? = null,
         categoryType: String? = null,
         categoryArea: String? = null,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse> =
-        callData(
-            "GET",
-            "comics",
-            com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse::class.java,
-            query = mapOf(
-                "page" to page,
-                "c" to category,
-                "t" to tag,
-                "a" to author,
-                "f" to finished,
-                "s" to sort,
-                "ct" to categoryType,
-                "ca" to categoryArea,
-            ),
+    ): PicaResult<ComicListResponse> = getComics(
+        ComicQuery(
+            page = page,
+            category = category,
+            tag = tag,
+            author = author,
+            finished = finished,
+            sort = sort,
+            categoryType = categoryType,
+            categoryArea = categoryArea,
+        ),
+    )
+
+    /** 按分类快捷获取漫画。 / Convenient helper for getting comics by category. */
+    @JvmOverloads
+    fun getComicsByCategory(
+        category: String,
+        page: Int = 1,
+        sort: String? = null,
+    ): PicaResult<ComicListResponse> =
+        getComics(ComicQuery(page = page, category = category, sort = sort))
+
+    /** 按标签快捷获取漫画。 / Convenient helper for getting comics by tag. */
+    @JvmOverloads
+    fun getComicsByTag(
+        tag: String,
+        page: Int = 1,
+        sort: String? = null,
+    ): PicaResult<ComicListResponse> =
+        getComics(ComicQuery(page = page, tag = tag, sort = sort))
+
+    /** 按作者快捷获取漫画。 / Convenient helper for getting comics by author. */
+    @JvmOverloads
+    fun getComicsByAuthor(
+        author: String,
+        page: Int = 1,
+        sort: String? = null,
+    ): PicaResult<ComicListResponse> =
+        getComics(ComicQuery(page = page, author = author, sort = sort))
+
+    /**
+     * 漫画关键词搜索便捷方法。
+     * Convenient comic search by keyword.
+     */
+    @JvmOverloads
+    fun searchComics(
+        keyword: String,
+        sort: String? = null,
+        categories: List<String>? = null,
+        page: Int = 1,
+    ): PicaResult<ComicListResponse> =
+        advancedSearchComics(
+            page = page,
+            body = SortingBody(keyword, sort, if (categories != null) ArrayList(categories) else null),
         )
 
     /** `POST comics/advanced-search` — 高级多条件搜索。 / advanced multi-filter search. */
+    @JvmOverloads
     fun advancedSearchComics(
-        page: Int,
+        page: Int = 1,
         body: SortingBody,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse> =
+    ): PicaResult<ComicListResponse> =
         callData(
             "POST",
             "comics/advanced-search",
-            com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse::class.java,
+            ComicListResponse::class.java,
             body = body,
             query = mapOf("page" to page),
         )
@@ -445,41 +585,108 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         callData("GET", "comics/$comicId", ComicDetailResponse::class.java)
 
     /** `GET comics/{comicId}/eps?page=` — 章节列表。 / episode list. */
+    @JvmOverloads
     fun getComicEpisodes(
         comicId: String,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicEpisodeResponse.ComicEpisodeResponse> =
+    ): PicaResult<ComicEpisodeResponse> =
         callData(
             "GET",
             "comics/$comicId/eps",
-            com.picacomic.fregata.objects.responses.DataClass.ComicEpisodeResponse.ComicEpisodeResponse::class.java,
+            ComicEpisodeResponse::class.java,
             query = mapOf("page" to page),
         )
 
     /** `GET comics/{comicId}/order/{order}/pages?page=` — 按章节序号取页。 / pages by episode order. */
+    @JvmOverloads
     fun getComicPagesByOrder(
         comicId: String,
         order: Int,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicPageResponse.ComicPagesResponse> =
+    ): PicaResult<ComicPagesResponse> =
         callData(
             "GET",
             "comics/$comicId/order/$order/pages",
-            com.picacomic.fregata.objects.responses.DataClass.ComicPageResponse.ComicPagesResponse::class.java,
+            ComicPagesResponse::class.java,
             query = mapOf("page" to page),
         )
 
     /** `GET eps/{epsId}/pages?page=` — 按章节 ID 取页。 / pages by episode ID. */
+    @JvmOverloads
     fun getEpisodePages(
         episodeId: String,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicPageResponse.ComicPagesResponse> =
+    ): PicaResult<ComicPagesResponse> =
         callData(
             "GET",
             "eps/$episodeId/pages",
-            com.picacomic.fregata.objects.responses.DataClass.ComicPageResponse.ComicPagesResponse::class.java,
+            ComicPagesResponse::class.java,
             query = mapOf("page" to page),
         )
+
+    /** 获取某章节的所有图片（自动循环翻页聚合）。 / Fetches all pages for a comic episode by paging until end. */
+    fun getAllComicPagesByOrder(comicId: String, order: Int): PicaResult<List<ComicPageObject>> {
+        val allPages = mutableListOf<ComicPageObject>()
+        var currentPage = 1
+        while (true) {
+            when (val res = getComicPagesByOrder(comicId, order, currentPage)) {
+                is PicaResult.Success -> {
+                    val pageData = res.data.pages ?: break
+                    val docs = pageData.docs ?: emptyList()
+                    allPages.addAll(docs)
+                    if (currentPage >= pageData.pages || docs.isEmpty()) {
+                        break
+                    }
+                    currentPage++
+                }
+                is PicaResult.Failure -> return res
+            }
+        }
+        return PicaResult.Success(allPages)
+    }
+
+    /**
+     * 下载单张图片为原始二进制字节数组。
+     *
+     * @param imageUrl 图片完整下载地址
+     * @return 字节数组结果
+     */
+    fun fetchImageBytes(imageUrl: String): PicaResult<ByteArray> =
+        PicaDownloader.fetchImageBytes(imageUrl, rawHttpClient)
+
+    /**
+     * 下载图片并安全原子写入目标文件。
+     *
+     * @param imageUrl 图片完整下载地址
+     * @param targetFile 保存的目标文件
+     * @param overwrite 是否覆盖已有文件，默认为 false
+     * @return 目标文件结果
+     */
+    @JvmOverloads
+    fun downloadImage(imageUrl: String, targetFile: File, overwrite: Boolean = false): PicaResult<File> =
+        PicaDownloader.downloadImage(imageUrl, targetFile, overwrite, rawHttpClient)
+
+    /**
+     * 并发下载单话/单章节的全部图片。
+     *
+     * @param comicId 漫画 ID
+     * @param episodeOrder 章节序号（从 1 开始）
+     * @param targetDir 本地保存目录
+     * @param concurrency 并发线程数，默认为 4
+     * @param overwrite 是否覆盖已有文件，默认为 false
+     * @param listener 进度监听器
+     * @return 按页面顺序排列的文件列表
+     */
+    @JvmOverloads
+    fun downloadEpisode(
+        comicId: String,
+        episodeOrder: Int,
+        targetDir: File,
+        concurrency: Int = 4,
+        overwrite: Boolean = false,
+        listener: DownloadProgressListener? = null
+    ): PicaResult<List<File>> =
+        PicaDownloader.downloadEpisode(this, comicId, episodeOrder, targetDir, concurrency, overwrite, listener)
 
     /** `GET comics/{comicId}/recommendation` — 相关推荐。 / related recommendations. */
     fun getComicRecommendation(comicId: String): PicaResult<ComicRandomListResponse> =
@@ -494,14 +701,15 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         callData("POST", "comics/$comicId/favourite", ActionResponse::class.java)
 
     /** `GET users/favourite?s=&page=` — 我的收藏。 / my favourites. */
+    @JvmOverloads
     fun getFavouriteComics(
-        sort: String,
+        sort: String = PicaSort.NEWEST,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse> =
+    ): PicaResult<ComicListResponse> =
         callData(
             "GET",
             "users/favourite",
-            com.picacomic.fregata.objects.responses.DataClass.ComicListResponse.ComicListResponse::class.java,
+            ComicListResponse::class.java,
             query = mapOf("s" to sort, "page" to page),
         )
 
@@ -510,14 +718,15 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     // region 评论 / comments --------------------------------------------------------------------
 
     /** `GET comics/{comicId}/comments?page=` — 漫画评论。 / comic comments. */
+    @JvmOverloads
     fun getComicComments(
         comicId: String,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse> =
+    ): PicaResult<CommentsResponse> =
         callData(
             "GET",
             "comics/$comicId/comments",
-            com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse::class.java,
+            CommentsResponse::class.java,
             query = mapOf("page" to page),
         )
 
@@ -525,23 +734,28 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     fun postComicComment(
         comicId: String,
         body: CommentBody,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse> =
+    ): PicaResult<PostCommentResponse> =
         callData(
             "POST",
             "comics/$comicId/comments",
-            com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse::class.java,
+            PostCommentResponse::class.java,
             body = body,
         )
 
+    /** `POST comics/{comicId}/comments` 便捷重载。 / convenient overload for postComicComment. */
+    fun postComicComment(comicId: String, content: String): PicaResult<PostCommentResponse> =
+        postComicComment(comicId, CommentBody(content))
+
     /** `GET games/{gameId}/comments?page=` — 游戏评论。 / game comments. */
+    @JvmOverloads
     fun getGameComments(
         gameId: String,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse> =
+    ): PicaResult<CommentsResponse> =
         callData(
             "GET",
             "games/$gameId/comments",
-            com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse::class.java,
+            CommentsResponse::class.java,
             query = mapOf("page" to page),
         )
 
@@ -549,35 +763,44 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     fun postGameComment(
         gameId: String,
         body: CommentBody,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse> =
+    ): PicaResult<PostCommentResponse> =
         callData(
             "POST",
             "games/$gameId/comments",
-            com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse::class.java,
+            PostCommentResponse::class.java,
             body = body,
         )
+
+    /** `POST games/{gameId}/comments` 便捷重载。 / convenient overload for postGameComment. */
+    fun postGameComment(gameId: String, content: String): PicaResult<PostCommentResponse> =
+        postGameComment(gameId, CommentBody(content))
 
     /** `POST comments/{commentId}` — 回复评论。 / reply to a comment. */
     fun replyComment(
         commentId: String,
         body: CommentBody,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse> =
+    ): PicaResult<PostCommentResponse> =
         callData(
             "POST",
             "comments/$commentId",
-            com.picacomic.fregata.objects.responses.DataClass.PostCommentResponse.PostCommentResponse::class.java,
+            PostCommentResponse::class.java,
             body = body,
         )
 
+    /** `POST comments/{commentId}` 便捷重载。 / convenient overload for replyComment. */
+    fun replyComment(commentId: String, content: String): PicaResult<PostCommentResponse> =
+        replyComment(commentId, CommentBody(content))
+
     /** `GET comments/{commentId}/childrens?page=` — 子评论。 / child comments. */
+    @JvmOverloads
     fun getCommentChildren(
         commentId: String,
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse> =
+    ): PicaResult<CommentsResponse> =
         callData(
             "GET",
             "comments/$commentId/childrens",
-            com.picacomic.fregata.objects.responses.DataClass.CommentsResponse.CommentsResponse::class.java,
+            CommentsResponse::class.java,
             query = mapOf("page" to page),
         )
 
@@ -598,13 +821,14 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
         callData("POST", "comments/$commentId/top", CommentPostToTopResponse::class.java)
 
     /** `GET users/my-comments?page=` — 我的评论。 / my comments. */
+    @JvmOverloads
     fun getMyComments(
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.ProfileCommentsResponse.ProfileCommentsResponse> =
+    ): PicaResult<ProfileCommentsResponse> =
         callData(
             "GET",
             "users/my-comments",
-            com.picacomic.fregata.objects.responses.DataClass.ProfileCommentsResponse.ProfileCommentsResponse::class.java,
+            ProfileCommentsResponse::class.java,
             query = mapOf("page" to page),
         )
 
@@ -613,24 +837,25 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     // region 游戏 / games -----------------------------------------------------------------------
 
     /** `GET games?page=` — 游戏列表。 / game list. */
+    @JvmOverloads
     fun getGames(
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.GameListResponse.GameListResponse> =
+    ): PicaResult<GameListResponse> =
         callData(
             "GET",
             "games",
-            com.picacomic.fregata.objects.responses.DataClass.GameListResponse.GameListResponse::class.java,
+            GameListResponse::class.java,
             query = mapOf("page" to page),
         )
 
     /** `GET games/{gameId}` — 游戏详情。 / game detail. */
     fun getGameDetail(
         gameId: String,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.GameDetailResponse.GameDetailResponse> =
+    ): PicaResult<GameDetailResponse> =
         callData(
             "GET",
             "games/$gameId",
-            com.picacomic.fregata.objects.responses.DataClass.GameDetailResponse.GameDetailResponse::class.java,
+            GameDetailResponse::class.java,
         )
 
     /** `POST games/{gameId}/like` — 游戏点赞。 / like a game. */
@@ -665,17 +890,43 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     fun updateAvatar(body: AvatarBody): PicaResult<PutAvatarResponse> =
         callData("PUT", "users/avatar", PutAvatarResponse::class.java, body = body)
 
+    /** `PUT users/avatar` 便捷重载（Base64 字符串）。 */
+    fun updateAvatar(base64Image: String): PicaResult<PutAvatarResponse> {
+        val dataUri = if (base64Image.startsWith("data:image")) base64Image else "data:image/jpeg;base64,$base64Image"
+        return updateAvatar(AvatarBody(dataUri))
+    }
+
+    /** `PUT users/avatar` 便捷重载（图片文件）。 */
+    fun updateAvatar(imageFile: File): PicaResult<PutAvatarResponse> {
+        val bytes = imageFile.readBytes()
+        return updateAvatar(bytes)
+    }
+
+    /** `PUT users/avatar` 便捷重载（图片字节流）。 */
+    fun updateAvatar(imageBytes: ByteArray): PicaResult<PutAvatarResponse> {
+        val base64 = Base64.getEncoder().encodeToString(imageBytes)
+        return updateAvatar(base64)
+    }
+
     /** `PUT users/password` — 修改密码。 / change the password. */
     fun changePassword(body: ChangePasswordBody): PicaResult<RegisterResponse> =
         callRaw("PUT", "users/password", RegisterResponse::class.java, body = body)
 
+    /** `PUT users/password` 便捷重载。 / convenient overload for changePassword. */
+    fun changePassword(oldPassword: String, newPassword: String): PicaResult<RegisterResponse> =
+        changePassword(ChangePasswordBody(oldPassword, newPassword))
+
     /** `PUT users/update-id` — 修改 Pica ID。 / change the Pica ID. */
     fun updatePicaId(body: UpdatePicaIdBody): PicaResult<Unit> =
-        callData("PUT", "users/update-id", Any::class.java, body = body)
+        callData("PUT", "users/update-id", Unit::class.java, body = body)
+
+    /** `PUT users/update-id` 便捷重载。 / convenient overload for updatePicaId. */
+    fun updatePicaId(email: String, newName: String): PicaResult<Unit> =
+        updatePicaId(UpdatePicaIdBody(email, newName))
 
     /** `PUT users/update-qa` — 更新密保问题。 / update security questions. */
     fun updateQandA(body: UpdateQandABody): PicaResult<Unit> =
-        callData("PUT", "users/update-qa", Any::class.java, body = body)
+        callData("PUT", "users/update-qa", Unit::class.java, body = body)
 
     /** `PUT users/{userId}/title` — 修改用户头衔。 / update a user's title. */
     fun updateUserTitle(
@@ -684,33 +935,61 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
     ): PicaResult<RegisterResponse> =
         callRaw("PUT", "users/$userId/title", RegisterResponse::class.java, body = body)
 
+    /** `PUT users/{userId}/title` 便捷重载。 / convenient overload for updateUserTitle. */
+    fun updateUserTitle(userId: String, title: String): PicaResult<RegisterResponse> =
+        updateUserTitle(userId, UpdateUserTitleBody(title))
+
     /** `POST utils/adjust-exp` — 调整经验值（管理端）。 / grant experience to a user (admin only). */
     fun adjustExp(body: AdjustExpBody): PicaResult<RegisterResponse> =
         callRaw("POST", "utils/adjust-exp", RegisterResponse::class.java, body = body)
 
     /** `POST utils/block-user` — 拉黑用户。 / block a user. */
     fun blockUser(body: UserIdBody): PicaResult<Unit> =
-        callData("POST", "utils/block-user", Any::class.java, body = body)
+        callData("POST", "utils/block-user", Unit::class.java, body = body)
+
+    /** `POST utils/block-user` 便捷重载。 / convenient overload for blockUser. */
+    fun blockUser(userId: String): PicaResult<Unit> =
+        blockUser(UserIdBody(userId))
 
     /** `POST utils/remove-comment` — 删除评论。 / remove a comment. */
     fun removeComment(body: UserIdBody): PicaResult<Unit> =
-        callData("POST", "utils/remove-comment", Any::class.java, body = body)
+        callData("POST", "utils/remove-comment", Unit::class.java, body = body)
+
+    /** `POST utils/remove-comment` 便捷重载。 / convenient overload for removeComment. */
+    fun removeComment(commentId: String): PicaResult<Unit> =
+        removeComment(UserIdBody(commentId))
 
     /** `GET users/notifications?page=` — 通知列表。 / notification list. */
+    @JvmOverloads
     fun getNotifications(
         page: Int = 1,
-    ): PicaResult<com.picacomic.fregata.objects.responses.DataClass.NotificationsResponse.NotificationsResponse> =
+    ): PicaResult<NotificationsResponse> =
         callData(
             "GET",
             "users/notifications",
-            com.picacomic.fregata.objects.responses.DataClass.NotificationsResponse.NotificationsResponse::class.java,
+            NotificationsResponse::class.java,
             query = mapOf("page" to page),
         )
 
     // endregion
 
-    private companion object {
+    companion object {
         /** JSON 请求体媒体类型。 / Media type used for JSON request bodies. */
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        /** 空请求体，用于不需要载荷的 POST/PUT 请求。 / Empty request body for parameter-less POST/PUT calls. */
+        val EMPTY_REQUEST_BODY = byteArrayOf().toRequestBody(null)
+
+        /** 创建默认配置的 [PicaClient]。 / Creates a [PicaClient] with default config. */
+        @JvmStatic
+        fun create(): PicaClient = PicaClient()
+
+        /** 使用指定配置创建 [PicaClient]。 / Creates a [PicaClient] with custom config. */
+        @JvmStatic
+        fun create(config: PicaConfig): PicaClient = PicaClient(config)
     }
 }
+
+/** Kotlin DSL: 便捷配置并初始化 [PicaClient]。 / Kotlin DSL for constructing [PicaClient]. */
+inline fun PicaClient(builderAction: PicaConfig.Builder.() -> Unit): PicaClient =
+    PicaClient(PicaConfig.build(builderAction))

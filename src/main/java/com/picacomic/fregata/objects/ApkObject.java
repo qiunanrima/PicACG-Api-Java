@@ -1,7 +1,7 @@
 package com.picacomic.fregata.objects;
 
 /**
- * APK
+ * APK 更新信息。
  * APK update information.
  */
 public class ApkObject {

@@ -307,7 +307,10 @@ class ChatroomClient @JvmOverloads constructor(
             profile?.let { emit("init", gson.toJson(it, UserProfileObject::class.java)) }
             listener?.onConnected()
         }
-        target.on("disconnect") { listener?.onDisconnected(roomUrl) }
+        target.on("disconnect") {
+            isConnected = false
+            listener?.onDisconnected(roomUrl)
+        }
         target.on("broadcast_message") { args -> dispatchMessage(args, TYPE_TEXT) { listener?.onMessage(it) } }
         target.on("broadcast_image") { args -> dispatchMessage(args, TYPE_IMAGE) { listener?.onImage(it) } }
         target.on("broadcast_audio") { args -> dispatchMessage(args, TYPE_AUDIO) { listener?.onAudio(it) } }
@@ -342,17 +345,35 @@ class ChatroomClient @JvmOverloads constructor(
             disconnect()
         }
         target.on("set_profile") { args ->
-            args.firstJsonObject()?.let { listener?.onProfileUpdated(it) }
+            val json = args.firstJsonObject()
+            if (json != null) {
+                profile?.let { p ->
+                    json.optString("name").takeIf { it.isNotBlank() }?.let(p::setName)
+                    json.optString("character").takeIf { it.isNotBlank() }?.let(p::setCharacter)
+                    json.optString("title").takeIf { it.isNotBlank() }?.let(p::setTitle)
+                    val level = json.optInt("level", 0)
+                    if (level > 0) p.level = level
+                }
+                listener?.onProfileUpdated(json)
+            }
         }
         target.on("change_character_icon") { args ->
             val character = args.firstJsonObject()?.optString("character").orEmpty()
-            if (character.isNotBlank()) listener?.onCharacterIconChanged(character)
+            if (character.isNotBlank()) {
+                profile?.character = character
+                listener?.onCharacterIconChanged(character)
+            }
         }
         target.on("change_title") { args ->
             val json = args.firstJsonObject() ?: return@on
             val userId = json.optString("user_id")
             val title = json.optString("title")
-            if (userId.isNotBlank() && title.isNotBlank()) listener?.onTitleChanged(userId, title)
+            if (userId.isNotBlank() && title.isNotBlank()) {
+                if (profile?.userId == userId) {
+                    profile?.title = title
+                }
+                listener?.onTitleChanged(userId, title)
+            }
         }
         target.on("error") { args -> listener?.onError(IllegalStateException(args.joinToString())) }
     }
@@ -495,4 +516,119 @@ interface ChatroomListener {
     fun onCharacterIconChanged(character: String) {}
     fun onTitleChanged(userId: String, title: String) {}
     fun onError(error: Throwable) {}
+}
+
+/**
+ * 用 lambda 快速实现 [ChatroomListener]，只传关心的回调即可。
+ * A lambda-based [ChatroomListener]; only pass the callbacks you care about.
+ *
+ * ```kotlin
+ * chat.listener = ChatroomCallbacks(
+ *     connected = { println("connected") },
+ *     message = { println(it.name + ": " + it.message) },
+ * )
+ * ```
+ */
+class ChatroomCallbacks(
+    private val connected: (() -> Unit)? = null,
+    private val disconnected: ((String?) -> Unit)? = null,
+    private val message: ((ChatMessageObject) -> Unit)? = null,
+    private val image: ((ChatMessageObject) -> Unit)? = null,
+    private val audio: ((ChatMessageObject) -> Unit)? = null,
+    private val privateMessage: ((ChatMessageObject) -> Unit)? = null,
+    private val ads: ((ChatMessageObject) -> Unit)? = null,
+    private val onlineCountChanged: ((String) -> Unit)? = null,
+    private val userJoined: ((String) -> Unit)? = null,
+    private val userLeft: ((String) -> Unit)? = null,
+    private val notification: ((String) -> Unit)? = null,
+    private val kicked: ((String) -> Unit)? = null,
+    private val profileUpdated: ((org.json.JSONObject) -> Unit)? = null,
+    private val characterIconChanged: ((String) -> Unit)? = null,
+    private val titleChanged: ((String, String) -> Unit)? = null,
+    private val error: ((Throwable) -> Unit)? = null,
+) : ChatroomListener {
+    override fun onConnected() { connected?.invoke() }
+    override fun onDisconnected(reason: String?) { disconnected?.invoke(reason) }
+    override fun onMessage(message: ChatMessageObject) { this.message?.invoke(message) }
+    override fun onImage(message: ChatMessageObject) { image?.invoke(message) }
+    override fun onAudio(message: ChatMessageObject) { audio?.invoke(message) }
+    override fun onPrivateMessage(message: ChatMessageObject) { privateMessage?.invoke(message) }
+    override fun onAds(message: ChatMessageObject) { ads?.invoke(message) }
+    override fun onOnlineCountChanged(onlineCount: String) { onlineCountChanged?.invoke(onlineCount) }
+    override fun onUserJoined(onlineCount: String) { userJoined?.invoke(onlineCount) }
+    override fun onUserLeft(onlineCount: String) { userLeft?.invoke(onlineCount) }
+    override fun onNotification(message: String) { notification?.invoke(message) }
+    override fun onKicked(message: String) { kicked?.invoke(message) }
+    override fun onProfileUpdated(json: org.json.JSONObject) { profileUpdated?.invoke(json) }
+    override fun onCharacterIconChanged(character: String) { characterIconChanged?.invoke(character) }
+    override fun onTitleChanged(userId: String, title: String) { titleChanged?.invoke(userId, title) }
+    override fun onError(error: Throwable) { this.error?.invoke(error) }
+
+    /** 供 Java 和 Kotlin 链式组装监听器的 Builder。 / Fluent builder for [ChatroomCallbacks]. */
+    class Builder {
+        private var connected: (() -> Unit)? = null
+        private var disconnected: ((String?) -> Unit)? = null
+        private var message: ((ChatMessageObject) -> Unit)? = null
+        private var image: ((ChatMessageObject) -> Unit)? = null
+        private var audio: ((ChatMessageObject) -> Unit)? = null
+        private var privateMessage: ((ChatMessageObject) -> Unit)? = null
+        private var ads: ((ChatMessageObject) -> Unit)? = null
+        private var onlineCountChanged: ((String) -> Unit)? = null
+        private var userJoined: ((String) -> Unit)? = null
+        private var userLeft: ((String) -> Unit)? = null
+        private var notification: ((String) -> Unit)? = null
+        private var kicked: ((String) -> Unit)? = null
+        private var profileUpdated: ((org.json.JSONObject) -> Unit)? = null
+        private var characterIconChanged: ((String) -> Unit)? = null
+        private var titleChanged: ((String, String) -> Unit)? = null
+        private var error: ((Throwable) -> Unit)? = null
+
+        fun onConnected(action: Runnable) = apply { this.connected = { action.run() } }
+        fun onDisconnected(action: java.util.function.Consumer<String?>) = apply { this.disconnected = { action.accept(it) } }
+        fun onMessage(action: java.util.function.Consumer<ChatMessageObject>) = apply { this.message = { action.accept(it) } }
+        fun onImage(action: java.util.function.Consumer<ChatMessageObject>) = apply { this.image = { action.accept(it) } }
+        fun onAudio(action: java.util.function.Consumer<ChatMessageObject>) = apply { this.audio = { action.accept(it) } }
+        fun onPrivateMessage(action: java.util.function.Consumer<ChatMessageObject>) = apply { this.privateMessage = { action.accept(it) } }
+        fun onAds(action: java.util.function.Consumer<ChatMessageObject>) = apply { this.ads = { action.accept(it) } }
+        fun onOnlineCountChanged(action: java.util.function.Consumer<String>) = apply { this.onlineCountChanged = { action.accept(it) } }
+        fun onUserJoined(action: java.util.function.Consumer<String>) = apply { this.userJoined = { action.accept(it) } }
+        fun onUserLeft(action: java.util.function.Consumer<String>) = apply { this.userLeft = { action.accept(it) } }
+        fun onNotification(action: java.util.function.Consumer<String>) = apply { this.notification = { action.accept(it) } }
+        fun onKicked(action: java.util.function.Consumer<String>) = apply { this.kicked = { action.accept(it) } }
+        fun onProfileUpdated(action: java.util.function.Consumer<org.json.JSONObject>) = apply { this.profileUpdated = { action.accept(it) } }
+        fun onCharacterIconChanged(action: java.util.function.Consumer<String>) = apply { this.characterIconChanged = { action.accept(it) } }
+        fun onTitleChanged(action: java.util.function.BiConsumer<String, String>) = apply { this.titleChanged = { u, t -> action.accept(u, t) } }
+        fun onError(action: java.util.function.Consumer<Throwable>) = apply { this.error = { action.accept(it) } }
+
+        fun build(): ChatroomCallbacks = ChatroomCallbacks(
+            connected = connected,
+            disconnected = disconnected,
+            message = message,
+            image = image,
+            audio = audio,
+            privateMessage = privateMessage,
+            ads = ads,
+            onlineCountChanged = onlineCountChanged,
+            userJoined = userJoined,
+            userLeft = userLeft,
+            notification = notification,
+            kicked = kicked,
+            profileUpdated = profileUpdated,
+            characterIconChanged = characterIconChanged,
+            titleChanged = titleChanged,
+            error = error,
+        )
+    }
+
+    companion object {
+        @JvmStatic
+        fun builder(): Builder = Builder()
+    }
+}
+
+/** Kotlin DSL: 便捷注册聊天室回调。 / Kotlin DSL for listening to chatroom events. */
+inline fun ChatroomClient.listen(block: ChatroomCallbacks.Builder.() -> Unit): ChatroomCallbacks {
+    val callbacks = ChatroomCallbacks.builder().apply(block).build()
+    this.listener = callbacks
+    return callbacks
 }

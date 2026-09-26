@@ -1,7 +1,7 @@
 package com.picacomic.fregata.objects;
 
 /**
- * PayPal
+ * PayPal 赞助条目。
  * PayPal support entry.
  */
 public class SupportUsPayPalObject {

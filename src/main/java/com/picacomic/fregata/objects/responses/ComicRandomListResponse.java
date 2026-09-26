@@ -4,7 +4,7 @@ import com.picacomic.fregata.objects.ComicListObject;
 import java.util.ArrayList;
 
 /**
- * 随机
+ * 随机 / 推荐漫画响应。
  * Random or recommended comics response.
  */
 public class ComicRandomListResponse {

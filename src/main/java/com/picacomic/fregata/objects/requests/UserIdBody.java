@@ -1,7 +1,7 @@
 package com.picacomic.fregata.objects.requests;
 
 /**
- * 用户
+ * 用户 ID 请求体。
  * User-id request body.
  */
 public class UserIdBody {

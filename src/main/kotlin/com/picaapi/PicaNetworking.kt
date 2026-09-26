@@ -97,7 +97,7 @@ object PicaNetworking {
         private fun configure(socket: Socket): Socket {
             if (socket is SSLSocket) {
                 val supported = socket.supportedProtocols.toSet()
-                val enabled = listOf("TLSv1.2", "TLSv1.1").filter { it in supported }
+                val enabled = listOf("TLSv1.3", "TLSv1.2", "TLSv1.1").filter { it in supported }
                 if (enabled.isNotEmpty()) socket.enabledProtocols = enabled.toTypedArray()
             }
             return socket

@@ -3,7 +3,7 @@ package com.picacomic.fregata.objects.responses;
 import java.util.ArrayList;
 
 /**
- * Waka
+ * Waka 初始化响应。
  * Waka init response.
  */
 public class WakaInitResponse {

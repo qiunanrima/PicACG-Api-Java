@@ -4,7 +4,7 @@ import com.picacomic.fregata.objects.PicaAppObject;
 import java.util.ArrayList;
 
 /**
- * Pica
+ * Pica 小应用列表响应。
  * Pica apps response.
  */
 public class PicaAppsResponse {

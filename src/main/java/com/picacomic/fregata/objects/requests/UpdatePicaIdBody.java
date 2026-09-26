@@ -1,7 +1,7 @@
 package com.picacomic.fregata.objects.requests;
 
 /**
- * 修改
+ * 修改 Pica ID 请求体。
  * Update Pica ID request body.
  */
 public class UpdatePicaIdBody {

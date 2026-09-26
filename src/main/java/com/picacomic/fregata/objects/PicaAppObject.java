@@ -1,7 +1,7 @@
 package com.picacomic.fregata.objects;
 
 /**
- * Pica
+ * Pica 小应用。
  * Pica app.
  */
 public class PicaAppObject extends PicaAppBaseObject {

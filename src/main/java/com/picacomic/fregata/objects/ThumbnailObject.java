@@ -2,7 +2,7 @@ package com.picacomic.fregata.objects;
 
 
 /**
- * 图片
+ * 图片 / 缩略图资源。
  * Image or thumbnail resource.
  */
 public class ThumbnailObject {
