@@ -1,6 +1,7 @@
 package com.picaapi
 
 import com.google.gson.Gson
+import com.google.gson.JsonObject
 import com.google.gson.reflect.TypeToken
 import com.picacomic.fregata.objects.ComicPageObject
 import com.picacomic.fregata.objects.NetworkErrorObject
@@ -260,6 +261,7 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             call.execute().use { response ->
                 val text = response.body?.string()
                 if (!response.isSuccessful) return failure(response.code, text)
+                if (!text.isNullOrBlank()) businessFailure(response.code, text)?.let { return it }
                 if (dataType == Unit::class.java) return PicaResult.Success(Unit as T, response.code)
                 if (text.isNullOrBlank()) return PicaResult.Success(null as T, response.code)
                 val envelopeType = TypeToken.getParameterized(GeneralResponse::class.java, dataType).type
@@ -279,6 +281,7 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             call.execute().use { response ->
                 val text = response.body?.string()
                 if (!response.isSuccessful) return failure(response.code, text)
+                if (!text.isNullOrBlank()) businessFailure(response.code, text)?.let { return it }
                 if (type == Unit::class.java) return PicaResult.Success(Unit as T, response.code)
                 if (text.isNullOrBlank()) return PicaResult.Success(null as T, response.code)
                 PicaResult.Success(gson.fromJson<T>(text, type), response.code)
@@ -302,6 +305,12 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
                         if (!res.isSuccessful) {
                             future.complete(failure(res.code, text))
                             return
+                        }
+                        if (!text.isNullOrBlank()) {
+                            businessFailure(res.code, text)?.let {
+                                future.complete(it)
+                                return
+                            }
                         }
                         if (dataType == Unit::class.java) {
                             @Suppress("UNCHECKED_CAST")
@@ -342,6 +351,12 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
                             future.complete(failure(res.code, text))
                             return
                         }
+                        if (!text.isNullOrBlank()) {
+                            businessFailure(res.code, text)?.let {
+                                future.complete(it)
+                                return
+                            }
+                        }
                         if (type == Unit::class.java) {
                             @Suppress("UNCHECKED_CAST")
                             future.complete(PicaResult.Success(Unit as T, res.code))
@@ -370,6 +385,25 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
             httpCode = httpCode,
             errorCode = error?.error,
             message = error?.message ?: error?.detail,
+            rawBody = rawBody,
+        )
+    }
+
+    /**
+     * PicACG normally mirrors the business status in the HTTP status, but some
+     * gateways return an HTTP 2xx response containing a non-2xx JSON `code`.
+     * Treat that response as a failure instead of exposing `Success(null)`.
+     */
+    private fun businessFailure(httpCode: Int, rawBody: String): PicaResult.Failure? {
+        val json = runCatching { gson.fromJson(rawBody, JsonObject::class.java) }.getOrNull() ?: return null
+        val code = runCatching { json.get("code")?.takeIf { it.isJsonPrimitive }?.asInt }.getOrNull()
+            ?: return null
+        if (code in 200..299) return null
+        return PicaResult.Failure(
+            httpCode = httpCode,
+            errorCode = json.get("error")?.takeIf { !it.isJsonNull }?.asString ?: code.toString(),
+            message = json.get("message")?.takeIf { !it.isJsonNull }?.asString
+                ?: json.get("detail")?.takeIf { !it.isJsonNull }?.asString,
             rawBody = rawBody,
         )
     }
@@ -975,7 +1009,11 @@ class PicaClient @JvmOverloads constructor(config: PicaConfig = PicaConfig()) {
 
     companion object {
         /** JSON 请求体媒体类型。 / Media type used for JSON request bodies. */
-        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        // 注意：PicACG 服务端对 charset 大小写敏感，必须是大写的 `UTF-8`；
+        // 小写 `utf-8` 会导致登录等 POST 接口返回 400/1023 "too many requests"。
+        // NOTE: the PicACG server is case-sensitive here; lowercase `utf-8` makes
+        // POST endpoints fail with 400/1023 "too many requests".
+        val JSON_MEDIA_TYPE = "application/json; charset=UTF-8".toMediaType()
 
         /** 空请求体，用于不需要载荷的 POST/PUT 请求。 / Empty request body for parameter-less POST/PUT calls. */
         val EMPTY_REQUEST_BODY = byteArrayOf().toRequestBody(null)

@@ -1,6 +1,7 @@
 package com.picaapi
 
 import com.picacomic.fregata.objects.UserProfileObject
+import com.picacomic.fregata.objects.requests.SignInBody
 import com.picacomic.fregata.objects.requests.UpdatePicaIdBody
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
@@ -78,6 +79,43 @@ class PicaClientTest {
     }
 
     @Test
+    fun testHttp200BusinessErrorIsFailure() {
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .body("""{"code":400,"error":"1004","message":"invalid signature"}""")
+                .build(),
+        )
+
+        val client = PicaClient(PicaConfig(baseUrl = server.url("/").toString()))
+        val result = client.getCategories()
+
+        assertTrue(result.isFailure)
+        val failure = result.getFailureOrNull()
+        assertEquals(200, failure?.httpCode)
+        assertEquals("1004", failure?.errorCode)
+        assertEquals("invalid signature", failure?.message)
+    }
+
+    @Test
+    fun testAsyncHttp200BusinessErrorIsFailure() {
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .body("""{"code":401,"error":"1005","detail":"token expired"}""")
+                .build(),
+        )
+
+        val client = PicaClient(PicaConfig(baseUrl = server.url("/").toString()))
+        val result = client.async.getCategories().get()
+
+        assertTrue(result.isFailure)
+        val failure = result.getFailureOrNull()
+        assertEquals("1005", failure?.errorCode)
+        assertEquals("token expired", failure?.message)
+    }
+
+    @Test
     fun testUpdateConfigRebuildsHttpClient() {
         val client = PicaClient(PicaConfig(enableLogging = false))
         client.updateConfig(PicaConfig(enableLogging = true))
@@ -138,6 +176,31 @@ class PicaClientTest {
         }
         chat.listener?.onConnected()
         assertTrue(connected)
+    }
+
+    @Test
+    fun testSignInContentTypeUsesUppercaseUtf8() {
+        // PicACG 服务端只接受 `charset=UTF-8`（大写），
+        // 小写 `utf-8` 会返回 400/1023 "too many requests"。
+        // The PicACG server only accepts uppercase `charset=UTF-8`;
+        // lowercase `utf-8` returns 400/1023 "too many requests".
+        server.enqueue(
+            MockResponse.Builder()
+                .code(200)
+                .body("""{"code":200,"message":"success","data":{"token":"t"}}""")
+                .build(),
+        )
+
+        val client = PicaClient(PicaConfig(baseUrl = server.url("/").toString()))
+        val result = client.signIn(SignInBody("user@example.com", "secret123"))
+
+        assertTrue(result.isSuccess)
+        val recorded = server.takeRequest()
+        assertEquals("POST", recorded.method)
+        assertEquals(
+            "application/json; charset=UTF-8",
+            recorded.headers["Content-Type"],
+        )
     }
 
     @Test
